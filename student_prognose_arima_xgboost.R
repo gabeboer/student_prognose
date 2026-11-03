@@ -14,6 +14,11 @@ library(tidyr)
 library(tidyverse)
 library(forecast)
 library(purrr)
+library(randomForest)
+library(caret)
+library(rpart)
+library(rpart.plot)
+library(writexl)
 
 gebruiker <- Sys.getenv("USERNAME")
 
@@ -185,7 +190,6 @@ voorspel_reeks <- function(data, peil, doeljaar, historische_jaren) {
   )
 }
 
-
 # Buitenste map: doeljaren
 prognoses_fwn <- map_dfr(
   doeljaren,
@@ -214,7 +218,8 @@ prognoses_fwn <- map_dfr(
     
     # Alleen peilmomenten die in de bron beschikbaar zijn
     peilmomenten <- snapshots %>%
-      filter(collegejaar == doeljaar) %>%
+      filter(collegejaar == doeljaar,
+             volgnummer %in% seq(4L, 48L, by = 4L)) %>%
       arrange(volgnummer) %>%
       pull(volgnummer)
     
@@ -282,7 +287,7 @@ prognoses_fwn <- map_dfr(
     )
   }
 )
-# ==============================================================================
+
 # In prognoses_fwn blijven de drie sleutelkolommen behouden. collegejaar geeft 
 # het doeljaar aan, peil_volgnummer het voorspelmoment en 
 # volgnummer de voorspelde week.
@@ -292,10 +297,449 @@ saveRDS(prognoses_fwn,
               pad_output,
               "prognoses_fwn.rds"
             ))
-
+# ==============================================================================
 # oorspronkelijke data per voorspelling er aan vast knopen om een uitgebreid arima 
 # outputfile te maken
+prognoses_fwn_52 <- readRDS(file = file.path(
+  pad_output,
+  "prognoses_fwn_52.rds"))
 
-# code volgt nog
+# # een bestand maken waarin de voorspellingen en de werkelijke telbestanden samenkomen
+# combi_bestand <- telbestanden_fwn %>% 
+#   select(-ongewogen) %>% 
+#   mutate(peil_volgnummer = volgnummer,
+#          ondergrens_95 = 0,
+#          bovengrens_95 = 0,
+#          voorspeld_gewogen = gewogen) %>% 
+#   relocate(isatcode,
+#            herkomst,
+#            geslacht,
+#            collegejaar,
+#            peil_volgnummer,
+#            volgnummer,
+#            voorspeld_gewogen,
+#            ondergrens_95,
+#            bovengrens_95)
 
-# dan weer oppakken / kantelen en klaarmaken voor xgboost
+sleutel <- c("collegejaar", "isatcode", "herkomst", "geslacht")
+
+# 1. Welke combinaties en peilmomenten zijn voorspeld?
+peilmomenten <- prognoses_fwn_52 %>%
+  distinct(
+    across(all_of(sleutel)),
+    peil_volgnummer
+  )
+# 2. Voor iedere combinatie de bekende weken aanmaken en koppelen
+werkelijke_regels <- peilmomenten %>%
+  mutate(
+    volgnummer = map(peil_volgnummer, ~ seq_len(.x))
+  ) %>%
+  unnest(volgnummer) %>%
+  left_join(
+    telbestanden_fwn %>%
+      select(all_of(sleutel), volgnummer, gewogen),
+    by = c(sleutel, "volgnummer"),
+    relationship = "many-to-one"
+  ) %>%
+  transmute(
+    across(all_of(sleutel)),
+    peil_volgnummer,
+    volgnummer,
+    voorspeld_gewogen = gewogen,
+    ondergrens_95 = NA_real_,
+    bovengrens_95 = NA_real_,
+    bron = "werkelijk"
+  )
+# 3. Werkelijkheid en voorspellingen samenvoegen
+aanmeldingen_compleet <- bind_rows(
+  werkelijke_regels,
+  prognoses_fwn_52 %>%
+    filter(volgnummer > peil_volgnummer) %>%
+    mutate(bron = "ARIMA")
+) %>%
+  arrange(
+    collegejaar, isatcode, herkomst, geslacht,
+    peil_volgnummer, volgnummer
+  ) %>% 
+  mutate(
+    voorspeld_gewogen = if_else(
+      bron == "werkelijk" & is.na(voorspeld_gewogen),
+      0,
+      voorspeld_gewogen
+    )
+    # ,
+    # geslacht = case_when(is.na(geslacht) ~ "O",
+    #                      TRUE ~ geslacht)
+  ) 
+ 
+# controle voor kantelen
+dubbele_cellen <- aanmeldingen_compleet %>%
+  count(
+    collegejaar, isatcode, herkomst, geslacht,
+    peil_volgnummer, volgnummer
+  ) %>%
+  filter(n > 1)
+
+
+ # en nu naar een behapbare dataset werken 
+input_ml <- aanmeldingen_compleet %>%
+  filter(peil_volgnummer > 5 & peil_volgnummer <47) %>% 
+  select(
+    all_of(sleutel), peil_volgnummer,
+    volgnummer, voorspeld_gewogen
+  ) %>%
+  pivot_wider(
+    names_from = volgnummer,
+    values_from = voorspeld_gewogen,
+    names_prefix = "volgnummer_",
+    names_sort = TRUE
+  ) %>% 
+  select(all_of(sleutel), volgnummer_6:volgnummer_46)
+# werkelijke_regels %>%
+#   filter(is.na(voorspeld_gewogen))
+
+# # de oorspronkelijke (niet voorspelde) regels bepalen en toevoegen
+# extra_regels <- prognoses_fwn_52 %>%
+#   distinct(
+#     across(all_of(sleutelkolommen)),
+#     collegejaar,
+#     peil_volgnummer
+#   ) %>%
+#   mutate(volgnummer = peil_volgnummer) %>% 
+#   left_join(telbestanden_fwn, by = c(
+#     "isatcode",
+#     "herkomst",
+#     "geslacht",
+#     "volgnummer",
+#     "collegejaar"
+#   )) %>% 
+#   select(-ongewogen) %>% 
+#   rename(voorspeld_gewogen = gewogen)
+
+# dit is dan de dataset waarop we een test en train dataset gaan maken en dan echt voorspellen
+# maar eerst de werkelijkheid ernaast zetten ......
+werkelijkheid_fwn <- instroom_fwn %>% 
+  select(inschrijvingsjaar:eoi) %>% 
+  filter(opleidingsvorm == "voltijd",
+         semester == 1) %>% 
+  mutate(herkomst = case_when(eer == "EER" ~ "E",
+                              eer == "Ned." ~ "N",
+                              TRUE ~ "R"),
+         geslacht = case_when(geslacht == "U" ~ "O",
+                              geslacht == "F" ~ "V",
+                              geslacht == "M" ~ "M",
+                              TRUE ~ "K"),
+         inschrijvingsjaar = as.numeric(inschrijvingsjaar),
+         isatcode = as.numeric(isatcode)) %>% 
+  select(-eer) %>% 
+  rename(collegejaar = inschrijvingsjaar) %>% 
+  group_by(collegejaar,
+           isatcode,
+           geslacht,
+           herkomst) %>% 
+  summarise(eoi = sum(eoi)) %>% 
+  ungroup()
+
+
+
+# input_prog_fwn_52 <- prognoses_fwn_52 %>% 
+#   select(-ondergrens_95,
+#          -bovengrens_95) %>% 
+#   bind_rows(extra_regels) %>% 
+#   arrange(isatcode,
+#           collegejaar,
+#           peil_volgnummer,
+#           volgnummer,
+#           geslacht,
+#           herkomst) %>% 
+#   # volgnummer kantelen naar de kolommen
+#   pivot_wider(
+#     id_cols = c(
+#       isatcode, herkomst, geslacht,
+#       collegejaar, peil_volgnummer
+#     ),
+#     names_from   = volgnummer,
+#     values_from  = voorspeld_gewogen,
+#     names_prefix = "volgnummer_",
+#     names_sort   = TRUE
+#   ) %>% 
+#   # eerste volgnummers mogen eruit, want slechte kwaliteit en de laatste ook
+#   select(-volgnummer_1,
+#          -volgnummer_2,
+#          -volgnummer_3,
+#          -volgnummer_4,
+#          -volgnummer_5) %>% 
+#   select(isatcode:volgnummer_40)
+
+
+
+# df klaar voor ML algoritmes
+input_prog_fwn_52_met_y <- input_ml %>% 
+  left_join(werkelijkheid_fwn, by = c(
+    "collegejaar",
+    "isatcode",
+    "geslacht",
+    "herkomst"
+  )) %>% 
+  # drop het collegejaar. we willen niet dat collegejaar een x-variabele is
+  select(-collegejaar,
+        ) %>% 
+  # filter(geslacht != "K" | !is.na(geslacht)) %>% 
+  # werkelijke na waarden veranderen in een 0.
+  mutate(geslacht = case_when(is.na(geslacht) ~ "O",
+                              TRUE ~ geslacht),
+         eoi = case_when(is.na(eoi) ~ 0,
+                         TRUE ~ eoi),
+         across(starts_with("volgnummer_"), ~ replace_na(.x, 0)))
+
+# test of dataset echt schoon is
+# Aantal NA's per kolom
+na_overzicht <- input_prog_fwn_52_met_y %>%
+  summarise(across(everything(), ~ sum(is.na(.x)))) %>%
+  tidyr::pivot_longer(
+    everything(),
+    names_to = "kolom",
+    values_to = "aantal_na"
+  ) %>%
+  filter(aantal_na > 0)
+
+
+
+
+# een onderscheid maken in train en test
+set.seed(407290)
+
+# dataset schudden
+hussel <- sample(nrow(input_prog_fwn_52_met_y))
+
+n_train <- round(.7 * nrow(input_prog_fwn_52_met_y)) # om te bepalen hoeveel records 70% is
+data_perm <- input_prog_fwn_52_met_y[hussel,]
+
+fwn_train <- data_perm[1:n_train,]
+fwn_test <- data_perm[(n_train + 1): nrow(input_prog_fwn_52_met_y),]
+
+#===============================================================================
+
+# random forest als eerste model
+n_trees <- 3000
+
+rf_model <- randomForest(eoi ~.,
+                         data = fwn_train,
+                         importance = TRUE,
+                         ntree = n_trees)
+print(rf_model)
+
+# het getrainde model draaien op de trainingsdata
+uitkomst_train <- predict(rf_model, fwn_train)
+uitkomst_train2 <-cbind(uitkomst_train, fwn_train) %>% 
+  relocate(uitkomst_train, .after = last_col()) %>% 
+  mutate(error = eoi - uitkomst_train,
+         abs_error = abs(error))
+
+# en op de testdata
+uitkomst_test <- predict(rf_model, fwn_test)
+uitkomst_test2 <-cbind(uitkomst_test, fwn_test) %>% 
+  relocate(uitkomst_test, .after = last_col()) %>% 
+  mutate(error = eoi - uitkomst_test,
+         abs_error = abs(error))
+
+write_xlsx(uitkomst_test2, 
+           path = "uitkomst_test_random_forest.xlsx")
+write_xlsx(uitkomst_train2, 
+           path = "uitkomst_train_random_forest.xlsx")
+
+# library(dplyr)
+# library(ggplot2)
+
+evaluatie <- fwn_test %>%
+  mutate(
+    voorspeld = as.numeric(predict(rf_model, newdata = fwn_test)),
+    fout = voorspeld - eoi
+  )
+
+ggplot(evaluatie, aes(x = eoi, y = voorspeld)) +
+  geom_point(alpha = 0.4, colour = "#0072B2") +
+  geom_abline(
+    intercept = 0, slope = 1,
+    linetype = "dashed", colour = "red"
+  ) +
+  coord_equal() +
+  labs(
+    title = "Random forest: voorspeld versus werkelijk",
+    subtitle = "Achtergehouden testdata; dichter bij de lijn is beter",
+    x = "Werkelijke EOI",
+    y = "Voorspelde EOI"
+  ) +
+  theme_minimal()
+
+evaluatie %>%
+  summarise(
+    MAE  = mean(abs(fout)),
+    RMSE = sqrt(mean(fout^2)),
+    bias = mean(fout),
+    R2   = 1 - sum(fout^2) / sum((eoi - mean(eoi))^2)
+  )
+
+randomForest::varImpPlot(
+  rf_model,
+  type = 1,
+  n.var = 20,
+  main = "Welke variabelen dragen bij aan de voorspelling?"
+)
+
+randomForest::varImpPlot(
+  rf_model,
+  type = 1,
+  scale = FALSE,
+  n.var = 20,
+  main = "Variabelenbelang: gemiddelde toename in MSE"
+)
+#===============================================================================
+# en nu met een decision tree.
+fwn_train_fact <- fwn_train %>% 
+  mutate(isatcode = as.character(isatcode))
+fwn_test_fact <- fwn_test %>% 
+  mutate(isatcode = as.character(isatcode))
+
+tree_model <- rpart(
+  eoi ~ .,
+  data = fwn_train_fact,
+  method = "anova",
+  control = rpart.control(
+    cp = 0.0001,
+    minsplit = 30,
+    minbucket = 15,
+    maxdepth = 5,
+    xval = 200
+  )
+)
+
+printcp(tree_model)
+plotcp(tree_model)
+
+# Kies de eenvoudigste boom binnen één standaardfout
+# van de laagste kruisvalidatiefout.
+cp_tabel <- tree_model$cptable
+beste <- which.min(cp_tabel[, "xerror"])
+
+grens <- cp_tabel[beste, "xerror"] +
+  cp_tabel[beste, "xstd"]
+
+gekozen_cp <- max(
+  cp_tabel[cp_tabel[, "xerror"] <= grens, "CP"]
+)
+
+tree_final <- prune(tree_model, cp = gekozen_cp)
+
+rpart.plot(
+  tree_final,
+  type = 2,
+  extra = 101,
+  fallen.leaves = TRUE,
+  box.palette = "Blues",
+  digits = 2,
+  main = "Beslisboom voor EOI"
+)
+
+evaluatie_tree <- fwn_test_fact %>%
+  mutate(
+    voorspeld = as.numeric(
+      predict(tree_final, newdata = fwn_test_fact)
+    ),
+    fout = voorspeld - eoi
+  )
+
+evaluatie_tree %>%
+  summarise(
+    MAE  = mean(abs(fout)),
+    RMSE = sqrt(mean(fout^2)),
+    bias = mean(fout),
+    R2   = 1 - sum(fout^2) / sum((eoi - mean(eoi))^2)
+  )
+
+# let op: isatcode wordt nu gezien als getal ipv factor. Geeft wat rare splits.
+# Bottom line: leuk om te visualeren, maar mindere voorspeller
+
+#===============================================================================
+# en nu xgboost
+library(xgboost)
+
+train_x <- fwn_train %>% select(-eoi)
+test_x  <- fwn_test  %>% select(-eoi)
+
+# Deze velden zijn categorieën
+categorieen <- c("isatcode", "herkomst", "geslacht")
+
+for (kolom in categorieen) {
+  train_x[[kolom]] <- as.character(train_x[[kolom]])
+  test_x[[kolom]]  <- as.character(test_x[[kolom]])
+}
+
+# Codering uitsluitend bepalen op de trainingsdata
+encoder <- dummyVars(
+  ~ .,
+  data = train_x,
+  fullRank = FALSE
+)
+
+x_train <- as.matrix(predict(encoder, newdata = train_x))
+x_test  <- as.matrix(predict(encoder, newdata = test_x))
+
+dtrain <- xgb.DMatrix(x_train, label = fwn_train$eoi)
+dtest  <- xgb.DMatrix(x_test,  label = fwn_test$eoi)
+
+parameters <- list(
+  objective = "reg:squarederror",
+  eval_metric = "rmse",
+  eta = 0.05,             # Kleine verbetering per nieuwe boom
+  max_depth = 3,          # Ondiepe bomen
+  min_child_weight = 5,
+  subsample = 0.8,        # Deel van de trainingsregels per ronde
+  colsample_bytree = 0.8  # Deel van de variabelen per boom
+)
+
+set.seed(407290)
+
+cv <- xgb.cv(
+  params = parameters,
+  data = dtrain,
+  nrounds = 2000,
+  nfold = 5,
+  stratified = FALSE,
+  early_stopping_rounds = 50,
+  verbose = 1
+)
+
+# Ronde met de laagste gemiddelde validatie-RMSE
+beste_ronde <- which.min(cv$evaluation_log$test_rmse_mean)
+
+xgb_model <- xgb.train(
+  params = parameters,
+  data = dtrain,
+  nrounds = beste_ronde,
+  verbose = 0
+)
+
+evaluatie_xgb <- tibble(
+  werkelijk = fwn_test$eoi,
+  voorspeld = as.numeric(predict(xgb_model, dtest))
+) %>%
+  mutate(fout = voorspeld - werkelijk)
+
+evaluatie_xgb %>%
+  summarise(
+    MAE  = mean(abs(fout)),
+    RMSE = sqrt(mean(fout^2)),
+    bias = mean(fout),
+    R2   = 1 - sum(fout^2) /
+      sum((werkelijk - mean(werkelijk))^2)
+  )
+
+belang <- xgb.importance(model = xgb_model)
+
+xgb.plot.importance(
+  belang,
+  top_n = 20,
+  main = "Variabelenbelang XGBoost"
+)
+#===============================================================================
